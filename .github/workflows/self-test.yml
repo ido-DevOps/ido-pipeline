@@ -1,0 +1,31 @@
+# Tests ido-pipeline itself on every push/PR. release.sh only moves the @v1 tag (used by all projects)
+# to a commit where this workflow passed — so a broken script can never reach your projects.
+name: self-test
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: ShellCheck all scripts
+        run: shellcheck scripts/*.sh hooks/pre-push tests/*.sh
+      - name: actionlint all workflows
+        run: |
+          bash <(curl -sSfL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash)
+          ./actionlint .github/workflows/*.yml templates/workflows/*.yml
+      - name: Python compiles
+        run: python3 -m py_compile scripts/*.py
+      - name: conflict-guard.yml embeds the current conflict_guard.py
+        run: python3 scripts/build.py --check
+      - name: Conflict Guard tests
+        run: bash tests/test_conflict_guard.sh
+      - name: onboard.sh tests
+        run: |
+          git config --global user.name ci; git config --global user.email ci@localhost
+          bash tests/test_onboard.sh

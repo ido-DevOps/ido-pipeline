@@ -1,0 +1,24 @@
+# Managed by ido-pipeline. Deploys main after a merge, only if CI passed.
+# Roll back: Actions → Deploy → Run workflow → enter an older commit SHA.
+name: Deploy
+on:
+  workflow_run:
+    workflows: [Pipeline]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref: { description: 'Commit SHA or tag to deploy (empty = latest main)', required: false, default: '' }
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    uses: __OWNER__/ido-pipeline/.github/workflows/deploy.yml@__REF__
+    with:
+      ref: ${{ inputs.ref || github.event.workflow_run.head_sha }}
+    secrets: inherit

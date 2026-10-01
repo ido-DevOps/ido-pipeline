@@ -1,0 +1,75 @@
+# Reusable Deploy — ships main to the server that runs the app, with health check + automatic rollback.
+# Needs these secrets in the project repo (onboard.sh --deploy sets them up):
+#   DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY, DEPLOY_PATH (git checkout on the server), RESTART_CMD
+#   optional: HEALTHCHECK_URL (must return HTTP 2xx after restart), TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+# Safety: refuses to deploy if the server checkout has local edits; never deletes files; rolls back on failure.
+name: deploy
+on:
+  workflow_call:
+    inputs:
+      ref: { type: string, default: '', description: 'commit/tag to deploy (empty = latest main). Use an old SHA to roll back.' }
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency: { group: "deploy-${{ github.repository }}", cancel-in-progress: false }
+    steps:
+      - name: Check configuration
+        id: cfg
+        env: { HOST: "${{ secrets.DEPLOY_HOST }}" }
+        run: |
+          if [ -z "$HOST" ]; then echo "::notice::DEPLOY_HOST not set — nothing to deploy."; echo "go=false" >> "$GITHUB_OUTPUT"
+          else echo "go=true" >> "$GITHUB_OUTPUT"; fi
+      - name: Deploy over SSH
+        if: steps.cfg.outputs.go == 'true'
+        uses: appleboy/ssh-action@v1
+        env:
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          RESTART_CMD: ${{ secrets.RESTART_CMD }}
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+          TARGET: ${{ inputs.ref || github.sha }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: DEPLOY_PATH,RESTART_CMD,HEALTHCHECK_URL,TARGET
+          script: |
+            set -u
+            cd "$DEPLOY_PATH" || { echo "DEPLOY_PATH not found"; exit 1; }
+            if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+              echo "Server checkout has local edits — refusing to deploy (nothing changed)."; git status --short; exit 1
+            fi
+            PREV="$(git rev-parse HEAD)"
+            git fetch -q origin || exit 1
+            git checkout -q --detach "$TARGET" || { echo "Unknown ref $TARGET"; exit 1; }
+            healthy() {
+              [ -z "$HEALTHCHECK_URL" ] && return 0
+              for _ in 1 2 3 4 5 6; do sleep 5; curl -fsS -o /dev/null "$HEALTHCHECK_URL" && return 0; done
+              return 1
+            }
+            if bash -c "$RESTART_CMD" && healthy; then
+              echo "DEPLOYED $(git rev-parse --short HEAD) (was ${PREV:0:7})"; exit 0
+            fi
+            echo "Deploy failed — rolling back to ${PREV:0:7}"
+            git checkout -q --detach "$PREV" && bash -c "$RESTART_CMD"
+            exit 1
+      - name: Telegram
+        if: always() && steps.cfg.outputs.go == 'true'
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          STATUS: ${{ job.status }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ inputs.ref || github.sha }}
+          URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TOKEN" ] || [ -z "$CHAT" ]; then exit 0; fi
+          # success = silent notification (no sound); failure = normal alert
+          if [ "$STATUS" = success ]; then msg="🚀 Deployed $REPO @ ${SHA:0:7}"; quiet=true; else msg="🔥 Deploy FAILED for $REPO — rolled back. $URL"; quiet=false; fi
+          curl -sS -o /dev/null "https://api.telegram.org/bot${TOKEN}/sendMessage" --data-urlencode "chat_id=${CHAT}" \
+            --data-urlencode "text=${msg}" --data-urlencode "disable_notification=${quiet}" || true

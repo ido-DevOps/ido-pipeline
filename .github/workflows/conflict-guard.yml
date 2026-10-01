@@ -1,0 +1,336 @@
+# Reusable Conflict Guard — called by every project's pipeline.yml on PR events and pushes to main.
+# Tells you BEFORE merging when two PRs (or a PR and main) change the same lines:
+# comment on the PR with both versions, 'merge-conflict' label, red check, Telegram alert.
+# The script below is generated from scripts/conflict_guard.py by scripts/build.py — edit that file, not this block.
+name: conflict-guard
+on:
+  workflow_call:
+    inputs:
+      base: { type: string, default: main }
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  guard:
+    name: Conflict Guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency: { group: "conflict-guard-${{ github.repository }}", cancel-in-progress: false }
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Check open PRs against main and against each other
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BASE: ${{ inputs.base }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          cat > "$RUNNER_TEMP/conflict_guard.py" <<'GUARD_EOF'
+          # >>> conflict_guard.py
+          #!/usr/bin/env python3
+          """Conflict Guard — finds branches/PRs that change the same lines BEFORE you merge them.
+
+          It checks:
+            1. every open PR (or local branch) against the base branch (main), and
+            2. every PAIR of PRs against each other: "if I merge #3 and then #5, do they collide?"
+
+          Read-only by design: all merges happen in a throw-away git worktree in /tmp. It never
+          commits to, pushes, resets or deletes any real branch. Standard library only.
+
+          GitHub mode (inside Actions):  GITHUB_TOKEN + GITHUB_REPOSITORY set
+              conflict_guard.py --base main [--pr 12]
+              → comments on each affected PR, adds/removes the 'merge-conflict' label, Telegram alert.
+          Local mode (tests / your Mac):
+              conflict_guard.py --base main --local feature-a feature-b [--json]
+
+          Exit code: 1 if conflicts were found (only those involving --pr when given), else 0.
+          """
+          from __future__ import annotations
+
+          import argparse
+          import itertools
+          import json
+          import os
+          import shutil
+          import subprocess
+          import sys
+          import tempfile
+          import urllib.error
+          import urllib.request
+
+          MARKER = "<!-- ido-conflict-guard -->"
+          LABEL = "merge-conflict"
+          GIT_ID = ["-c", "user.name=conflict-guard", "-c", "user.email=guard@localhost",
+                    "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"]
+
+
+          # ----------------------------------------------------------------------------- git helpers
+          def git(*args: str, cwd: str | None = None, check: bool = True) -> subprocess.CompletedProcess:
+              p = subprocess.run(["git", *GIT_ID, *args], cwd=cwd, text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              if check and p.returncode != 0:
+                  raise RuntimeError(f"git {' '.join(args)} failed:\n{p.stderr.strip()}")
+              return p
+
+
+          def conflict_hunks(wt: str) -> list[dict]:
+              """After a failed merge in worktree `wt`: list conflicted files with line ranges + both sides."""
+              files = git("diff", "--name-only", "--diff-filter=U", cwd=wt).stdout.split()
+              out = []
+              for f in files:
+                  path = os.path.join(wt, f)
+                  hunks = []
+                  try:
+                      with open(path, encoding="utf-8", errors="replace") as fh:
+                          lines = fh.read().splitlines()
+                  except (IsADirectoryError, FileNotFoundError):
+                      lines = []
+                  i = 0
+                  while i < len(lines):
+                      if lines[i].startswith("<<<<<<<"):
+                          start, ours, theirs, side = i + 1, [], [], "ours"
+                          j = i + 1
+                          while j < len(lines) and not lines[j].startswith(">>>>>>>"):
+                              if lines[j].startswith("=======") and side == "ours":
+                                  side = "theirs"
+                              elif lines[j].startswith("|||||||"):
+                                  side = "base"
+                              elif side == "ours":
+                                  ours.append(lines[j])
+                              elif side == "theirs":
+                                  theirs.append(lines[j])
+                              j += 1
+                          hunks.append({"line": start, "ours": ours[:6], "theirs": theirs[:6]})
+                          i = j
+                      i += 1
+                  out.append({"file": f, "hunks": hunks})
+              return out
+
+
+          def try_merge(wt: str, base: str, first: str, second: str | None = None) -> list[dict]:
+              """Merge `first` (then `second`) onto `base` inside the worktree. Returns conflicts ([] = clean)."""
+              git("checkout", "-q", "--detach", base, cwd=wt)
+              git("reset", "-q", "--hard", base, cwd=wt)
+              git("clean", "-qfdx", cwd=wt)
+              steps = [first] + ([second] if second else [])
+              for n, ref in enumerate(steps):
+                  p = git("merge", "--no-ff", "--no-edit", "-m", f"guard {ref}", ref, cwd=wt, check=False)
+                  if p.returncode != 0:
+                      hunks = conflict_hunks(wt)
+                      git("merge", "--abort", cwd=wt, check=False)
+                      if not hunks and n == 0:  # merge failed for a non-content reason
+                          raise RuntimeError(p.stderr.strip() or p.stdout.strip())
+                      return hunks or [{"file": "(merge failed)", "hunks": []}]
+              return []
+
+
+          def analyse(repo: str, base: str, items: dict[str, str]) -> dict:
+              """items: label -> git ref. Returns {'base': {label: conflicts}, 'pairs': [{a,b,conflicts}]}."""
+              tmp = tempfile.mkdtemp(prefix="guard-")
+              wt = os.path.join(tmp, "wt")
+              git("worktree", "add", "-q", "--detach", wt, base, cwd=repo)
+              try:
+                  result = {"base": {}, "pairs": []}
+                  clean = []
+                  for label, ref in items.items():
+                      c = try_merge(wt, base, ref)
+                      if c:
+                          result["base"][label] = c
+                      else:
+                          clean.append(label)
+                  for a, b in itertools.combinations(clean, 2):
+                      c = try_merge(wt, base, items[a], items[b])
+                      if c:
+                          result["pairs"].append({"a": a, "b": b, "conflicts": c})
+                  return result
+              finally:
+                  git("worktree", "remove", "--force", wt, cwd=repo, check=False)
+                  shutil.rmtree(tmp, ignore_errors=True)
+                  git("worktree", "prune", cwd=repo, check=False)
+
+
+          # ----------------------------------------------------------------------------- reporting
+          def fmt_conflicts(conflicts: list[dict], a: str, b: str) -> str:
+              rows = []
+              for c in conflicts[:10]:
+                  if not c["hunks"]:
+                      rows.append(f"- `{c['file']}`")
+                      continue
+                  for h in c["hunks"][:5]:
+                      rows.append(f"- `{c['file']}` around line {h['line']}")
+                      if h["ours"] or h["theirs"]:
+                          rows.append("  <details><summary>show both versions</summary>\n")
+                          rows.append(f"  **{a}:**\n  ```\n" + "\n".join("  " + x for x in h["ours"]) + "\n  ```")
+                          rows.append(f"  **{b}:**\n  ```\n" + "\n".join("  " + x for x in h["theirs"]) + "\n  ```\n  </details>")
+              return "\n".join(rows)
+
+
+          def report_for(label: str, res: dict, base: str) -> str | None:
+              parts = []
+              if label in res["base"]:
+                  parts.append(f"### ❌ Conflicts with `{base}`\nThis PR and `{base}` changed the same lines. "
+                               f"Update this branch from `{base}` and pick the right version:\n"
+                               + fmt_conflicts(res["base"][label], base, label))
+              for p in res["pairs"]:
+                  if label in (p["a"], p["b"]):
+                      other = p["b"] if p["a"] == label else p["a"]
+                      parts.append(f"### ⚠️ Collides with {other}\n{p['a']} and {p['b']} both change the same lines. "
+                                   f"**Which version do you want?** Merge that PR first; the other one will then need "
+                                   f"its conflict resolved before it can be merged.\n" + fmt_conflicts(p["conflicts"], p["a"], p["b"]))
+              if not parts:
+                  return None
+              return f"{MARKER}\n## 🛡️ Conflict Guard\n" + "\n\n".join(parts) + \
+                  "\n\n<sub>Re-checked automatically on every push and every merge to main. " \
+                  "To fix: tell the assistant 'resolve the conflict in PR #N, keep the version from PR #M' (it runs Claude Code on your Mac).</sub>"
+
+
+          def print_text(res: dict, base: str) -> None:
+              if not res["base"] and not res["pairs"]:
+                  print("✅ No conflicts: every branch merges cleanly into", base, "and with each other.")
+                  return
+              for label, c in res["base"].items():
+                  print(f"❌ {label} conflicts with {base}: " + ", ".join(x["file"] for x in c))
+              for p in res["pairs"]:
+                  print(f"⚠️  {p['a']} and {p['b']} change the same lines: " + ", ".join(x["file"] for x in p["conflicts"]))
+
+
+          # ----------------------------------------------------------------------------- GitHub API
+          class GitHub:
+              def __init__(self, repo: str, token: str):
+                  self.repo, self.token = repo, token
+
+              def call(self, method: str, path: str, body: dict | None = None):
+                  url = path if path.startswith("http") else f"https://api.github.com/repos/{self.repo}{path}"
+                  req = urllib.request.Request(url, method=method, data=json.dumps(body).encode() if body is not None else None,
+                                               headers={"Authorization": f"Bearer {self.token}",
+                                                        "Accept": "application/vnd.github+json",
+                                                        "X-GitHub-Api-Version": "2022-11-28"})
+                  try:
+                      with urllib.request.urlopen(req, timeout=30) as r:
+                          data = r.read()
+                          return json.loads(data) if data else None
+                  except urllib.error.HTTPError as e:
+                      if e.code == 404 and method == "DELETE":
+                          return None
+                      print(f"::warning::GitHub API {method} {path} → {e.code} {e.read()[:200]!r}")
+                      return None
+
+              def open_prs(self, base: str) -> list[dict]:
+                  return self.call("GET", f"/pulls?state=open&base={base}&per_page=50") or []
+
+              def upsert_comment(self, pr: int, body: str | None) -> bool:
+                  """Returns True if the visible state changed (used to avoid repeat alerts)."""
+                  comments = self.call("GET", f"/issues/{pr}/comments?per_page=100") or []
+                  mine = next((c for c in comments if MARKER in (c.get("body") or "")), None)
+                  if body is None:
+                      if mine:
+                          self.call("PATCH", f"/issues/comments/{mine['id']}",
+                                    {"body": f"{MARKER}\n## 🛡️ Conflict Guard\n✅ Resolved — no conflicts any more."})
+                          return True
+                      return False
+                  if mine and mine["body"] == body:
+                      return False
+                  if mine:
+                      self.call("PATCH", f"/issues/comments/{mine['id']}", {"body": body})
+                  else:
+                      self.call("POST", f"/issues/{pr}/comments", {"body": body})
+                  return True
+
+              def set_label(self, pr: int, on: bool) -> None:
+                  if on:
+                      self.call("POST", "/labels", {"name": LABEL, "color": "d73a4a",
+                                                    "description": "Changes the same lines as main or another PR"})
+                      self.call("POST", f"/issues/{pr}/labels", {"labels": [LABEL]})
+                  else:
+                      self.call("DELETE", f"/issues/{pr}/labels/{LABEL}")
+
+
+          def telegram(text: str) -> None:
+              tok, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+              if not (tok and chat):
+                  return
+              req = urllib.request.Request(f"https://api.telegram.org/bot{tok}/sendMessage",
+                                           data=json.dumps({"chat_id": chat, "text": text[:4000],
+                                                            "disable_web_page_preview": True}).encode(),
+                                           headers={"Content-Type": "application/json"})
+              try:
+                  urllib.request.urlopen(req, timeout=15)
+              except Exception as e:  # never fail the check because of a notification
+                  print(f"::warning::Telegram notification failed: {e}")
+
+
+          # ----------------------------------------------------------------------------- main
+          def main() -> int:
+              ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+              ap.add_argument("--repo", default=".")
+              ap.add_argument("--base", default="main")
+              ap.add_argument("--pr", type=int, help="focus PR: exit 1 only if THIS PR is involved")
+              ap.add_argument("--local", nargs="*", help="local mode: branch names to check")
+              ap.add_argument("--json", action="store_true")
+              a = ap.parse_args()
+              repo = os.path.abspath(a.repo)
+
+              if a.local is not None:
+                  base = a.base
+                  items = {b: b for b in a.local}
+                  res = analyse(repo, base, items)
+                  print(json.dumps(res, indent=2)) if a.json else print_text(res, base)
+                  return 1 if (res["base"] or res["pairs"]) else 0
+
+              token, slug = os.environ.get("GITHUB_TOKEN"), os.environ.get("GITHUB_REPOSITORY")
+              if not (token and slug):
+                  print("Need GITHUB_TOKEN and GITHUB_REPOSITORY (or use --local).", file=sys.stderr)
+                  return 2
+              gh = GitHub(slug, token)
+              prs = gh.open_prs(a.base)
+              if not prs:
+                  print("No open PRs — nothing to check.")
+                  return 0
+              git("fetch", "-q", "origin", f"+refs/heads/{a.base}:refs/guard/base",
+                  *[f"+refs/pull/{p['number']}/head:refs/guard/pr-{p['number']}" for p in prs], cwd=repo)
+              items = {f"PR #{p['number']}": f"refs/guard/pr-{p['number']}" for p in prs}
+              res = analyse(repo, "refs/guard/base", items)
+              print_text(res, a.base)
+
+              alerts = []
+              for p in prs:
+                  label = f"PR #{p['number']}"
+                  body = report_for(label, res, a.base)
+                  changed = gh.upsert_comment(p["number"], body)
+                  gh.set_label(p["number"], body is not None)
+                  if body and changed:
+                      alerts.append(f"• {label} “{p['title']}”: {p['html_url']}")
+              if alerts:
+                  telegram(f"🛡️ Conflict Guard — {slug}\nThese PRs change the same lines; decide which version wins:\n"
+                           + "\n".join(alerts))
+
+              summary = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary:
+                  with open(summary, "a") as fh:
+                      fh.write("## 🛡️ Conflict Guard\n")
+                      for label in items:
+                          fh.write((report_for(label, res, a.base) or f"✅ {label}: clean").replace(MARKER, "") + "\n\n")
+
+              if a.pr:
+                  me = f"PR #{a.pr}"
+                  involved = me in res["base"] or any(me in (x["a"], x["b"]) for x in res["pairs"])
+                  return 1 if involved else 0
+              return 1 if (res["base"] or res["pairs"]) else 0
+
+
+          if __name__ == "__main__":
+              sys.exit(main())
+          # <<< conflict_guard.py
+          GUARD_EOF
+          if [ -n "$PR" ]; then
+            # On a PR: red check if THIS PR collides with main or another PR
+            python3 "$RUNNER_TEMP/conflict_guard.py" --base "$BASE" --pr "$PR"
+          else
+            # After a merge to main: refresh every PR's warning, but never block main/deploys
+            python3 "$RUNNER_TEMP/conflict_guard.py" --base "$BASE" || echo "::warning::Some open PRs now conflict — see their comments."
+          fi

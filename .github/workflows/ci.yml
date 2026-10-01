@@ -1,0 +1,121 @@
+# Reusable CI — called by every project's .github/workflows/pipeline.yml.
+# Edit it HERE once; all projects pick it up through the @v1 tag (see README → Releasing).
+# Jobs: secrets scan · code quality + tests · security scan · Telegram alert on failure.
+name: ci
+on:
+  workflow_call:
+    inputs:
+      python-version: { type: string, default: '3.12' }
+      node-version:   { type: string, default: '22' }
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: Secrets scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: Scan every commit for leaked keys/passwords
+        env: { GITLEAKS_VERSION: 8.21.2 }
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz gitleaks
+          if ! ./gitleaks git --redact --no-banner --exit-code 1 .; then
+            echo "::error::A secret (API key, token, password) is committed. Remove it, ROTATE the key, and if it is a false alarm add its fingerprint to .gitleaksignore."
+            exit 1
+          fi
+
+  quality:
+    name: Code quality + tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect stack
+        id: s
+        run: |
+          py=false; node=false; sh=false
+          [ -n "$(find . -name '*.py' -not -path './.venv/*' -not -path './node_modules/*' -print -quit)" ] && py=true
+          [ -f package.json ] && node=true
+          [ -n "$(find . -name '*.sh' -not -path './node_modules/*' -not -path './.git/*' -print -quit)" ] && sh=true
+          { echo "python=$py"; echo "node=$node"; echo "shell=$sh"; } | tee -a "$GITHUB_OUTPUT"
+
+      # ---- Python: real-bug lint (syntax errors, undefined names) + tests
+      - if: steps.s.outputs.python == 'true'
+        uses: actions/setup-python@v5
+        with: { python-version: '${{ inputs.python-version }}' }
+      - if: steps.s.outputs.python == 'true'
+        name: Python — install, lint, tests
+        run: |
+          python -m pip install -q --upgrade pip ruff
+          if [ -f requirements.txt ]; then pip install -q -r requirements.txt; fi
+          if [ -f pyproject.toml ]; then pip install -q -e . || echo "::warning::pyproject install failed"; fi
+          ruff check --select E9,F63,F7,F82 --output-format=github .
+          if [ -d tests ] || compgen -G "test_*.py" >/dev/null || compgen -G "*/test_*.py" >/dev/null; then
+            pip install -q pytest && pytest -q
+          else
+            echo "::notice::No tests yet — ask the assistant to add some (tests/test_*.py)."
+          fi
+
+      # ---- Node: install, lint, test, build
+      - if: steps.s.outputs.node == 'true'
+        uses: actions/setup-node@v4
+        with: { node-version: '${{ inputs.node-version }}' }
+      - if: steps.s.outputs.node == 'true'
+        name: Node — install, lint, test, build
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install --no-audit; fi
+          npm run lint --if-present
+          npm test --if-present
+          npm run build --if-present
+
+      # ---- Shell scripts: catch real errors
+      - if: steps.s.outputs.shell == 'true'
+        name: ShellCheck
+        run: find . -name '*.sh' -not -path './node_modules/*' -not -path './.git/*' -print0 | xargs -0 -r shellcheck -S error
+
+  security:
+    name: Security scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '${{ inputs.python-version }}' }
+      - name: Semgrep (dangerous code patterns, injections, hard-coded secrets)
+        run: |
+          pip install -q semgrep
+          semgrep scan --config p/default --severity ERROR --error --metrics=off --quiet \
+            --exclude node_modules --exclude .venv --exclude dist
+      - name: Python — bandit + vulnerable dependencies
+        run: |
+          if [ -n "$(find . -name '*.py' -not -path './.venv/*' -not -path './node_modules/*' -print -quit)" ]; then
+            pip install -q bandit
+            bandit -q -r . -lll -iii -x ./.venv,./node_modules,./tests
+          fi
+          if [ -f requirements.txt ]; then
+            pip install -q pip-audit
+            pip-audit -r requirements.txt --progress-spinner off
+          fi
+      - name: Node — vulnerable dependencies
+        if: hashFiles('package-lock.json') != ''
+        run: npm audit --audit-level=high --omit=dev
+
+  notify:
+    name: Alert on failure
+    needs: [secrets, quality, security]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Telegram
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          TEXT: "❌ CI failed — ${{ github.repository }} (${{ github.ref_name }})\n${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          if [ -z "$TOKEN" ] || [ -z "$CHAT" ]; then echo "Telegram secrets not set — skipping"; exit 0; fi
+          curl -sS -o /dev/null "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${CHAT}" --data-urlencode "text=$(printf '%b' "$TEXT")" || true
