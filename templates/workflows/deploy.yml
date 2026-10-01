@@ -21,4 +21,12 @@ jobs:
     uses: __OWNER__/ido-pipeline/.github/workflows/deploy.yml@__REF__
     with:
       ref: ${{ inputs.ref || github.event.workflow_run.head_sha }}
-    secrets: inherit
+    secrets:
+      DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+      DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+      DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+      RESTART_CMD: ${{ secrets.RESTART_CMD }}
+      HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

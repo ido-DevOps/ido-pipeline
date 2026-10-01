@@ -8,6 +8,15 @@ on:
   workflow_call:
     inputs:
       ref: { type: string, default: '', description: 'commit/tag to deploy (empty = latest main). Use an old SHA to roll back.' }
+    secrets:
+      DEPLOY_HOST:        { required: false }
+      DEPLOY_USER:        { required: false }
+      DEPLOY_SSH_KEY:     { required: false }
+      DEPLOY_PATH:        { required: false }
+      RESTART_CMD:        { required: false }
+      HEALTHCHECK_URL:    { required: false }
+      TELEGRAM_BOT_TOKEN: { required: false }
+      TELEGRAM_CHAT_ID:   { required: false }
 
 permissions:
   contents: read
