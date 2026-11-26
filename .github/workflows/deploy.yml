@@ -41,12 +41,12 @@ jobs:
           DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
           RESTART_CMD: ${{ secrets.RESTART_CMD }}
           HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
-          TARGET: ${{ inputs.ref || github.sha }}
+          DEPLOY_REF: ${{ inputs.ref || github.sha }}
         with:
           host: ${{ secrets.DEPLOY_HOST }}
           username: ${{ secrets.DEPLOY_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
-          envs: DEPLOY_PATH,RESTART_CMD,HEALTHCHECK_URL,TARGET
+          envs: DEPLOY_PATH,RESTART_CMD,HEALTHCHECK_URL,DEPLOY_REF
           script: |
             set -u
             cd "$DEPLOY_PATH" || { echo "DEPLOY_PATH not found"; exit 1; }
@@ -55,7 +55,7 @@ jobs:
             fi
             PREV="$(git rev-parse HEAD)"
             git fetch -q origin || exit 1
-            git checkout -q --detach "$TARGET" || { echo "Unknown ref $TARGET"; exit 1; }
+            git checkout -q --detach "$DEPLOY_REF" || { echo "Unknown ref $DEPLOY_REF"; exit 1; }
             healthy() {
               [ -z "$HEALTHCHECK_URL" ] && return 0
               for _ in 1 2 3 4 5 6; do sleep 5; curl -fsS -o /dev/null "$HEALTHCHECK_URL" && return 0; done
