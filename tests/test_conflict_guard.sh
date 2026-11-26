@@ -9,6 +9,7 @@ g() { git -c user.name=t -c user.email=t@t -c commit.gpgsign=false "$@"; }
 check() { # name expected_exit actual_exit
   if [ "$2" = "$3" ]; then echo "  ✓ $1"; else echo "  ✗ $1 (expected exit $2, got $3)"; fail=1; fi
 }
+rc() { "$@"; echo $?; } # exit code of a condition, e.g. "$(rc [ a = a ])" (newer ShellCheck rejects `[ ]; ... $?`)
 
 cd "$T"; g init -q -b main repo; cd repo
 printf 'line1\nline2\nline3\nline4\nline5\n' > app.py; printf 'a\n' > other.txt
@@ -34,8 +35,8 @@ echo "$out" | grep -q '"base"';                                 check "reported 
 
 # Safety: the guard must never move a branch or leave anything behind
 refs_after="$(git for-each-ref --format='%(refname) %(objectname)' refs/heads | grep -v refs/heads/main)"
-[ "$refs_before" = "$refs_after" ];                             check "no branch was moved" 0 $?
-[ "$(git worktree list | wc -l)" = 1 ];                         check "temporary worktree removed" 0 $?
-[ "$(git rev-parse --abbrev-ref HEAD)" = main ];                check "user's checkout untouched" 0 $?
-[ -z "$(git status --porcelain)" ];                             check "working tree still clean" 0 $?
+check "no branch was moved" 0 "$(rc [ "$refs_before" = "$refs_after" ])"
+check "temporary worktree removed" 0 "$(rc [ "$(git worktree list | wc -l)" = 1 ])"
+check "user's checkout untouched" 0 "$(rc [ "$(git rev-parse --abbrev-ref HEAD)" = main ])"
+check "working tree still clean" 0 "$(rc [ -z "$(git status --porcelain)" ])"
 exit $fail
